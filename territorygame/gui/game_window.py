@@ -210,10 +210,29 @@ class GameWindow:
             f"Deaths: {player.death_count}",
             f"Turns left: {player.remaining_turns}",
             "State:",
-            player.debug_state or "",
+            *self._wrap_text(player.debug_state or "", width - 16, self._font),
         ]
         for i, line in enumerate(lines):
             self._blit(line, x + 8, y + 50 + i * 18, self._font)
+
+    @staticmethod
+    def _wrap_text(text: str, max_width: int, font: pygame.font.Font) -> list[str]:
+        """Greedy word-wrap so a long debug_state string doesn't run off
+        the edge of its player card."""
+        words = text.split()
+        if not words:
+            return [""]
+        lines: list[str] = []
+        current = words[0]
+        for word in words[1:]:
+            candidate = f"{current} {word}"
+            if font.size(candidate)[0] <= max_width:
+                current = candidate
+            else:
+                lines.append(current)
+                current = word
+        lines.append(current)
+        return lines
 
     def _draw_status_bar(self, snapshot: GameSnapshot) -> None:
         bar_y = self._board_area.bottom
