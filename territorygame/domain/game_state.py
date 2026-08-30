@@ -28,7 +28,7 @@ class GameState:
         return self._board
 
     def get_players(self) -> list[Player]:
-        return self._players
+        return list(self._players)
 
     def get_player(self, player_id: PlayerId) -> Player:
         for player in self._players:
