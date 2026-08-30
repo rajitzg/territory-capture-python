@@ -31,6 +31,21 @@ _SIDE_PANEL_WIDTH = 300
 _TOP_BAR_HEIGHT = 90
 _STATUS_BAR_HEIGHT = 40
 _MAX_BOARD_PIXELS = 800
+_MIN_TURN_DELAY_MILLIS = 0
+_MAX_TURN_DELAY_MILLIS = 500
+# Slider travel is 0-1000; delay is mapped through a square curve so the
+# fast end isn't cramped into a tiny fraction of the track (same curve
+# Java's GameWindow used).
+_SPEED_SLIDER_MAX = 1000
+
+
+def _delay_to_slider(delay_millis: int) -> int:
+    return round((delay_millis / _MAX_TURN_DELAY_MILLIS) ** 0.5 * _SPEED_SLIDER_MAX)
+
+
+def _slider_to_delay(slider_value: int) -> int:
+    t = slider_value / _SPEED_SLIDER_MAX
+    return round(t * t * _MAX_TURN_DELAY_MILLIS)
 
 
 class _SnapshotSink(GameObserver):
@@ -65,6 +80,61 @@ class _Button:
     def handle_click(self, position: tuple[int, int]) -> None:
         if self.rect.collidepoint(position):
             self.on_click()
+
+
+class _Slider:
+    """Horizontal drag slider — pygame has no built-in JSlider equivalent,
+    so this is a minimal hand-rolled one: a track, a round handle, and
+    click-or-drag-to-set-value, matching Swing's JSlider closely enough to
+    stand in for it."""
+
+    def __init__(self, rect: pygame.Rect, min_value: int, max_value: int, initial_value: int, on_change) -> None:
+        self.rect = rect
+        self._min_value = min_value
+        self._max_value = max_value
+        self._value = initial_value
+        self._on_change = on_change
+        self._dragging = False
+
+    @property
+    def value(self) -> int:
+        return self._value
+
+    def _value_from_x(self, x: int) -> int:
+        t = (x - self.rect.x) / self.rect.width
+        t = max(0.0, min(1.0, t))
+        return round(self._min_value + t * (self._max_value - self._min_value))
+
+    def _handle_x(self) -> int:
+        t = (self._value - self._min_value) / (self._max_value - self._min_value)
+        return self.rect.x + round(t * self.rect.width)
+
+    def handle_mouse_down(self, position: tuple[int, int]) -> None:
+        # A generous vertical hit area around the thin track, since the
+        # visible line is only a few pixels tall.
+        hit_rect = self.rect.inflate(0, 16)
+        if hit_rect.collidepoint(position):
+            self._dragging = True
+            self._set_value(self._value_from_x(position[0]))
+
+    def handle_mouse_motion(self, position: tuple[int, int]) -> None:
+        if self._dragging:
+            self._set_value(self._value_from_x(position[0]))
+
+    def handle_mouse_up(self) -> None:
+        self._dragging = False
+
+    def _set_value(self, value: int) -> None:
+        if value != self._value:
+            self._value = value
+            self._on_change(value)
+
+    def draw(self, surface: pygame.Surface) -> None:
+        track_y = self.rect.centery
+        pygame.draw.line(surface, _BUTTON_BORDER, (self.rect.x, track_y), (self.rect.right, track_y), 3)
+        handle_x = self._handle_x()
+        pygame.draw.circle(surface, (90, 90, 90), (handle_x, track_y), 7)
+        pygame.draw.circle(surface, (255, 255, 255), (handle_x, track_y), 4)
 
 
 class _ControllerPicker(_Button):
@@ -123,9 +193,12 @@ class GameWindow:
             _Button(pygame.Rect(88, 46, 70, 28), "Pause", self._engine.pause),
             _Button(pygame.Rect(166, 46, 70, 28), "Step", self._engine.step),
             _Button(pygame.Rect(244, 46, 70, 28), "Reset", self._reset),
-            _Button(pygame.Rect(324, 46, 60, 28), "Faster", self._speed_up),
-            _Button(pygame.Rect(392, 46, 60, 28), "Slower", self._speed_down),
         ]
+        clamped_initial_delay = max(_MIN_TURN_DELAY_MILLIS, min(_MAX_TURN_DELAY_MILLIS, self._turn_delay_millis))
+        self._speed_slider = _Slider(
+            pygame.Rect(404, 60, 140, 4), 0, _SPEED_SLIDER_MAX,
+            _delay_to_slider(clamped_initial_delay), self._on_speed_slider_changed,
+        )
 
         self._engine.reset(initial_controllers)
 
@@ -143,12 +216,10 @@ class GameWindow:
     def _reset(self) -> None:
         self._engine.reset(self._current_selections())
 
-    def _speed_up(self) -> None:
-        self._turn_delay_millis = max(0, self._turn_delay_millis - 40)
-        self._engine.set_turn_delay_millis(self._turn_delay_millis)
-
-    def _speed_down(self) -> None:
-        self._turn_delay_millis = min(500, self._turn_delay_millis + 40)
+    def _on_speed_slider_changed(self, slider_value: int) -> None:
+        """Left is Fast (0ms), right is Slow (500ms); see _slider_to_delay
+        for the curve."""
+        self._turn_delay_millis = _slider_to_delay(slider_value)
         self._engine.set_turn_delay_millis(self._turn_delay_millis)
 
     def run(self) -> None:
@@ -163,6 +234,11 @@ class GameWindow:
                         picker.handle_click(event.pos)
                     for button in self._buttons:
                         button.handle_click(event.pos)
+                    self._speed_slider.handle_mouse_down(event.pos)
+                elif event.type == pygame.MOUSEMOTION:
+                    self._speed_slider.handle_mouse_motion(event.pos)
+                elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                    self._speed_slider.handle_mouse_up()
 
             self._draw()
             clock.tick(60)
@@ -174,6 +250,7 @@ class GameWindow:
             picker.draw(self._screen, self._font)
         for button in self._buttons:
             button.draw(self._screen, self._font)
+        self._draw_speed_control()
 
         snapshot = self._sink.latest()
         if snapshot is not None:
@@ -182,6 +259,14 @@ class GameWindow:
             self._draw_status_bar(snapshot)
 
         pygame.display.flip()
+
+    def _draw_speed_control(self) -> None:
+        """Controls the pause between turns during continuous play
+        (Start); Step always runs immediately."""
+        self._blit("Speed:", 324, 52, self._font)
+        self._blit("Fast", 372, 52, self._font)
+        self._speed_slider.draw(self._screen)
+        self._blit("Slow", 552, 52, self._font)
 
     def _draw_side_panel(self, snapshot: GameSnapshot) -> None:
         x = self._board_area.right + 10
