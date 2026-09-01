@@ -25,7 +25,7 @@ class ControllerOption:
 
 ALL: list[ControllerOption] = [
     ControllerOption("Basic State Machine", lambda seed: BasicStateMachine()),
-    ControllerOption("Enemy State Machine", EnemyStateMachine),
+    ControllerOption("Enemy State Machine", lambda seed: EnemyStateMachine()),
     ControllerOption("Random State Machine", lambda seed: RandomStateMachine()),
     ControllerOption("Candidate Controller", lambda seed: CandidateController()),
 ]

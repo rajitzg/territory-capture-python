@@ -1,28 +1,10 @@
 """Framework code: the standard opponent used for assessment runs. Not part
 of the candidate-facing surface.
 
-Five states, organized by risk posture and picked fresh every turn
-(highest priority first):
-- DEFENSIVE - our owned territory just shrank since last turn, meaning an
-  opponent capture is in progress or just landed. Chase their visible
-  trail for a kill if we can see one; otherwise fall back to heading home.
-- RECEDING - safe. Our trail is long, we're low enough on turns that
-  pushing further risks not making it back, the opponent is visible and
-  close while we're exposed, or we're already ahead and the match is
-  nearly over. Head for the nearest owned territory, or shuffle around
-  inside it if we're already there.
-- AGGRESSIVE - risky. The opponent's trail or territory is visible and
-  we're not currently in danger; go take it.
-- EXPANDING - the default. Deterministically push toward whichever safe
-  direction opens onto the most free space.
-- WANDERING - a rare, single-turn detour: pick at random among directions
-  whose open-space score is merely close to the best. Never fires two
-  turns in a row.
-
-Earlier versions of this bot got stuck in short back-and-forth loops
-against itself. WANDERING periodically (and briefly) makes the whole
-match non-deterministic, which is enough to knock either agent off any
-cycle regardless of its length."""
+Grows territory in small rectangular bites that always stay inside a
+configurable box around its own head — so by construction it can never be
+caught out in the open with no safe way home — and only fights when the
+opponent trespasses onto its own land."""
 
 import random
 from enum import Enum, auto
@@ -33,206 +15,153 @@ from territorygame.api.game_api import GameApi
 from territorygame.api.grid_position import GridPosition
 from territorygame.api.occupant_view import OccupantView
 from territorygame.api.territory_view import TerritoryView
-from territorygame.api.visible_cell import VisibleCell
 from territorygame.helpers.movement_utils import (
     find_cell,
     is_valid_board_move,
     is_within_board,
     manhattan_distance,
     next_position,
-    random_direction,
+    valid_directions,
 )
 
-_MAX_TRAIL_BEFORE_RETURN = 8
-_SAFETY_TURN_BUFFER = 4
-_CONSOLIDATE_TURNS_THRESHOLD = 30
-_WANDER_OPENNESS_TOLERANCE = 1
-_RANDOM_WANDER_CHANCE = 0.01
+_SAFETY_GRID_SIZE = 7
+_OUT_LOOKAHEAD = 2
 
 
-class _State(Enum):
-    DEFENSIVE = auto()
-    RECEDING = auto()
-    AGGRESSIVE = auto()
-    EXPANDING = auto()
-    WANDERING = auto()
+class _Phase(Enum):
+    ATTACK = auto()
+    REPOSITION = auto()
+    OUT = auto()
+    ACROSS = auto()
+    BACK = auto()
 
 
 class EnemyStateMachine(AgentController):
-    def __init__(self, seed: int | None = None) -> None:
-        """Two instances of this same deterministic logic need different
-        seeds, or they'll play out identically for long stretches. Passing
-        None seeds from OS entropy, same as Java's no-arg constructor."""
-        self._random = random.Random(seed)
-        self._current_state = _State.EXPANDING
-        self._previous_owned_territory_count = 0
-        self._first_move = True
-        self._direction: Direction | None = None
-        self._best_open_neighbor_count = 0
+    def __init__(self) -> None:
+        self._phase = _Phase.OUT
+        self._out_direction: Direction | None = None
+        self._steps_out = 0
+        self._across_direction: Direction | None = None
+        self._reposition_direction: Direction | None = None
+        self._random = random.Random(42)
 
     def take_turn(self, game: GameApi) -> None:
-        # Even with different seeds, two fresh instances facing a symmetric
-        # starting position can still tie on every heuristic and open in the
-        # same relative direction. Forcing a genuinely random opening move
-        # breaks that up front.
-        if self._first_move:
-            self._first_move = False
-            self._current_state = _State.WANDERING
-            game.move(self._pick_uniformly_random(game))
-            return
-        previous_state = self._current_state
-        self._current_state = self._decide_state(game, previous_state)
-        direction = self._choose_direction(game, self._current_state)
+        intrusion = self._find_opponent_trail_on_our_territory(game)
+        if intrusion is not None:
+            self._phase = _Phase.ATTACK
+            direction = self._pick_attack(game, intrusion)
+        elif not game.get_active_trail():
+            direction = self._pick_trail_free(game)
+        else:
+            direction = self._pick_expedition(game)
         game.move(direction)
 
     def get_debug_state(self) -> str | None:
-        return (
-            f"{self._current_state.name} {self._direction}, "
-            f"bestOpenNeighborCount: {self._best_open_neighbor_count}"
-        )
+        return self._phase.name
 
-    # ---- State selection ----------------------------------------------
+    # ---- ATTACK / REPOSITION ---------------------------------------------
 
-    def _decide_state(self, game: GameApi, previous_state: _State) -> _State:
-        territory_shrank = game.get_owned_territory_cell_count() < self._previous_owned_territory_count
-        self._previous_owned_territory_count = game.get_owned_territory_cell_count()
-        if territory_shrank:
-            return _State.DEFENSIVE
-        if self._should_recede(game):
-            return _State.RECEDING
-        if self._should_be_aggressive(game):
-            return _State.AGGRESSIVE
-        if previous_state != _State.WANDERING and self._random.random() < _RANDOM_WANDER_CHANCE:
-            return _State.WANDERING
-        return _State.EXPANDING
+    def _pick_attack(self, game: GameApi, target: GridPosition) -> Direction:
+        """A free kill: crossing their trail sends them back to respawn, no risk to us."""
+        return self._choose_best(game, self._huntable_directions(game), self._distance_to_key(game, target))
 
-    def _should_recede(self, game: GameApi) -> bool:
-        trail = game.get_active_trail()
-        if trail:
-            if len(trail) >= _MAX_TRAIL_BEFORE_RETURN:
-                return True
-            if game.get_remaining_turns() <= len(trail) + _SAFETY_TURN_BUFFER:
-                return True
-            if self._opponent_is_threateningly_close(game):
-                return True
-        return self._is_endgame_with_lead(game)
+    def _pick_trail_free(self, game: GameApi) -> Direction:
+        """Chooses a move on owned territory or starts OUT when the chosen move leaves it."""
+        safe = self._safe_directions(game)
+        territory_only = [d for d in safe if self._is_self_territory(game, self._destination(game, d))]
 
-    def _should_be_aggressive(self, game: GameApi) -> bool:
-        return (
-            self._nearest_occupant(game, OccupantView.OPPONENT_TRAIL) is not None
-            or self._nearest_territory(game, TerritoryView.OPPONENT) is not None
-        )
+        if (
+            self._reposition_direction is not None
+            and self._reposition_direction in territory_only
+            and self._distance_to_outside_territory(game, self._reposition_direction) <= _OUT_LOOKAHEAD
+        ):
+            self._phase = _Phase.REPOSITION
+            return self._reposition_direction
 
-    def _opponent_is_threateningly_close(self, game: GameApi) -> bool:
-        threat_distance = len(game.get_visible_grid()) // 2
-        position = self._nearest_occupant(game, OccupantView.OPPONENT_AGENT)
-        if position is None:
+        outside_territory = [d for d in safe if d not in territory_only]
+        if outside_territory:
+            self._phase = _Phase.OUT
+            self._out_direction = (
+                self._reposition_direction
+                if self._reposition_direction in outside_territory
+                else self._choose_random(game, self._prefer_vertical(outside_territory))
+            )
+            self._reposition_direction = None
+            self._steps_out = 1
+            return self._out_direction
+
+        self._phase = _Phase.REPOSITION
+        approaches = self._closest_approach_directions(game, territory_only)
+        if approaches:
+            self._reposition_direction = self._choose_random(game, approaches)
+            return self._reposition_direction
+        if self._reposition_direction is not None and self._reposition_direction in territory_only:
+            return self._reposition_direction
+        self._reposition_direction = self._choose_random(game, safe if not territory_only else territory_only)
+        return self._reposition_direction
+
+    # ---- Expedition: OUT / ACROSS / BACK --------------------------------
+
+    def _pick_expedition(self, game: GameApi) -> Direction:
+        """Continues whichever part of an active expedition was last selected."""
+        if self._phase == _Phase.OUT:
+            return self._pick_out(game)
+        if self._phase == _Phase.ACROSS:
+            return self._pick_across(game)
+        # ATTACK/REPOSITION never reach here; BACK, and any interrupted-then-resumed
+        # phase left over from an ATTACK detour, both just keep heading home.
+        return self._pick_back(game)
+
+    def _pick_out(self, game: GameApi) -> Direction:
+        next_head = self._destination(game, self._out_direction)
+        if (
+            self._out_direction in self._safe_directions(game)
+            and not self._is_self_territory(game, next_head)
+            and self.fits_safety_grid(next_head, game.get_active_trail(), _SAFETY_GRID_SIZE)
+        ):
+            self._steps_out += 1
+            return self._out_direction
+        self._phase = _Phase.ACROSS
+        self._across_direction = self._pick_across_direction(game)
+        return self._pick_across(game)
+
+    def _pick_across_direction(self, game: GameApi) -> Direction:
+        perpendicular = [
+            d for d in self.perpendicular_options(self._out_direction)
+            if self._can_take_another_across_step(game, d)
+        ]
+        if not perpendicular:
+            # Both perpendicular options are blocked; this will fail the
+            # grid/mirror check below and fall back to BACK.
+            return self._out_direction
+        return self._choose_random(game, perpendicular)
+
+    def _pick_across(self, game: GameApi) -> Direction:
+        if self._can_take_another_across_step(game, self._across_direction):
+            return self._across_direction
+        self._phase = _Phase.BACK
+        return self._pick_back(game)
+
+    def _can_take_another_across_step(self, game: GameApi, direction: Direction) -> bool:
+        if direction not in self._safe_directions(game):
             return False
-        return manhattan_distance(game.get_agent_position(), position) <= threat_distance
+        next_head = self._destination(game, direction)
+        if not self.fits_safety_grid(next_head, game.get_active_trail(), _SAFETY_GRID_SIZE):
+            return False
+        mirrored = self.mirror_back(next_head, self._out_direction, self._steps_out)
+        return self._is_self_territory(game, mirrored)
 
-    def _is_endgame_with_lead(self, game: GameApi) -> bool:
-        return (
-            game.get_remaining_turns() <= _CONSOLIDATE_TURNS_THRESHOLD
-            and game.get_owned_territory_cell_count() > game.get_opponent_territory_cell_count()
-        )
+    # ---- Shared BACK logic ------------------------------------------------
 
-    # ---- Direction selection --------------------------------------------
-
-    def _choose_direction(self, game: GameApi, state: _State) -> Direction:
-        if state == _State.DEFENSIVE:
-            return self._pick_defensive(game)
-        if state == _State.RECEDING:
-            return self._pick_receding(game)
-        if state == _State.AGGRESSIVE:
-            return self._pick_aggressive(game)
-        if state == _State.EXPANDING:
-            return self._pick_expanding(game)
-        return self._pick_wandering(game)
-
-    def _pick_defensive(self, game: GameApi) -> Direction:
-        """Chases the opponent's visible trail to stop an in-progress
-        capture cold; otherwise falls back to heading home."""
-        hunted = self._hunt_opponent_trail(game)
-        return hunted if hunted is not None else self._pick_receding(game)
-
-    def _pick_expanding(self, game: GameApi) -> Direction:
-        """Deterministically pushes toward whichever safe direction opens
-        onto the most free space."""
-        best = self._choose_best(self._safe_directions(game), self._most_open_first_key(game))
-        self._direction = best
-        self._best_open_neighbor_count = self._open_neighbor_count(game, best)
-        return best
-
-    def _pick_receding(self, game: GameApi) -> Direction:
-        """Stays inside our own territory if any safe move lands there
-        (zero trail risk); otherwise heads for the nearest of it."""
-        within_territory = [
-            direction for direction in self._safe_directions(game)
-            if self._territory_at(game, self._destination(game, direction)) == TerritoryView.SELF
-        ]
-        if within_territory:
-            return self._choose_best(within_territory, self._most_open_first_key(game))
-        target = self._nearest_territory(game, TerritoryView.SELF)
-        if target is None:
-            target = game.get_respawn_position()
-        return self._choose_best(self._safe_directions(game), self._distance_to_key(game, target))
-
-    def _pick_aggressive(self, game: GameApi) -> Direction:
-        """Chases the opponent's trail for a kill if one's visible;
-        otherwise cuts toward their territory to steal it on capture."""
-        hunted = self._hunt_opponent_trail(game)
-        if hunted is not None:
-            return hunted
-        target = self._nearest_territory(game, TerritoryView.OPPONENT)
-        if target is None:
-            target = game.get_agent_position()
-        return self._choose_best(self._safe_directions(game), self._distance_to_key(game, target))
-
-    def _hunt_opponent_trail(self, game: GameApi) -> Direction | None:
-        """Shared by DEFENSIVE and AGGRESSIVE: a direction that closes on
-        the opponent's visible trail, if one is visible at all."""
-        target = self._nearest_occupant(game, OccupantView.OPPONENT_TRAIL)
-        if target is None:
-            return None
-        return self._choose_best(self._huntable_directions(game), self._distance_to_key(game, target))
-
-    def _pick_wandering(self, game: GameApi) -> Direction:
-        """Picks at random among the directions whose open-space score is
-        close to the best, so it's never fully predictable."""
-        candidates = self._safe_directions(game)
-        if not candidates:
-            return self._fallback()
-        best_score = max(self._open_neighbor_count(game, direction) for direction in candidates)
-        good_enough = [
-            direction for direction in candidates
-            if self._open_neighbor_count(game, direction) >= best_score - _WANDER_OPENNESS_TOLERANCE
-        ]
-        return good_enough[self._random.randrange(len(good_enough))]
-
-    def _pick_uniformly_random(self, game: GameApi) -> Direction:
-        """Picks uniformly among every safe direction, with no bias toward
-        open space at all — only used for the opening move."""
-        candidates = self._safe_directions(game)
-        if not candidates:
-            return self._fallback()
-        return candidates[self._random.randrange(len(candidates))]
-
-    def _distance_to_key(self, game: GameApi, target: GridPosition):
-        return lambda direction: manhattan_distance(self._destination(game, direction), target)
-
-    def _most_open_first_key(self, game: GameApi):
-        return lambda direction: -self._open_neighbor_count(game, direction)
-
-    def _choose_best(self, candidates: list[Direction], ranking) -> Direction:
-        if not candidates:
-            return self._fallback()
-        return min(candidates, key=ranking)
+    def _pick_back(self, game: GameApi) -> Direction:
+        """Walks opposite out_direction. ACROSS already required that this path lands on owned land."""
+        reverse = self.opposite(self._out_direction)
+        safe = self._safe_directions(game)
+        return reverse if reverse in safe else self._choose_random(game, safe)
 
     # ---- Board reading -----------------------------------------------------
 
     def _safe_directions(self, game: GameApi) -> list[Direction]:
-        """Directions that are in bounds and land on neither trail nor the
-        opponent's agent."""
         result = []
         for direction in Direction:
             if not is_valid_board_move(
@@ -246,7 +175,7 @@ class EnemyStateMachine(AgentController):
 
     def _huntable_directions(self, game: GameApi) -> list[Direction]:
         """Like _safe_directions, but allows stepping onto the opponent's
-        trail — that's the point of hunting."""
+        trail — that's how a chase ends in a kill."""
         result = []
         for direction in Direction:
             if not is_valid_board_move(
@@ -258,61 +187,124 @@ class EnemyStateMachine(AgentController):
                 result.append(direction)
         return result
 
-    def _open_neighbor_count(self, game: GameApi, direction: Direction) -> int:
-        """Count of on-board empty unowned cells cardinally adjacent to the
-        destination. Off-board neighbors are not open."""
-        destination = self._destination(game, direction)
-        count = 0
-        for neighbor_direction in Direction:
-            neighbor = next_position(destination, neighbor_direction)
-            if self._is_open(self._cell_at(game, neighbor)):
-                count += 1
-        return count
-
-    def _nearest_occupant(self, game: GameApi, occupant: OccupantView) -> GridPosition | None:
-        return self._nearest_visible(game, lambda cell: cell.occupant == occupant)
-
-    def _nearest_territory(self, game: GameApi, territory: TerritoryView) -> GridPosition | None:
-        return self._nearest_visible(game, lambda cell: cell.territory == territory)
+    @staticmethod
+    def _occupant_at(game: GameApi, position: GridPosition) -> OccupantView:
+        cell = find_cell(game.get_visible_grid(), position)
+        return OccupantView.EMPTY if cell is None else cell.occupant
 
     @staticmethod
-    def _nearest_visible(game: GameApi, matches) -> GridPosition | None:
-        origin = game.get_agent_position()
+    def _destination(game: GameApi, direction: Direction) -> GridPosition:
+        return next_position(game.get_agent_position(), direction)
+
+    def _closest_approach_directions(self, game: GameApi, candidates: list[Direction]) -> list[Direction]:
+        closest: list[Direction] = []
+        closest_distance = _OUT_LOOKAHEAD + 1
+        for direction in candidates:
+            distance = self._distance_to_outside_territory(game, direction)
+            if distance < closest_distance:
+                closest = []
+                closest_distance = distance
+            if distance == closest_distance and distance <= _OUT_LOOKAHEAD:
+                closest.append(direction)
+        return self._prefer_vertical(closest)
+
+    @staticmethod
+    def _distance_to_outside_territory(game: GameApi, direction: Direction) -> int:
+        position = game.get_agent_position()
+        for distance in range(1, _OUT_LOOKAHEAD + 1):
+            position = next_position(position, direction)
+            if not is_within_board(position, game.get_board_width(), game.get_board_height()):
+                break
+            cell = find_cell(game.get_visible_grid(), position)
+            if cell is None:
+                break
+            if cell.territory != TerritoryView.SELF:
+                return distance
+        return _OUT_LOOKAHEAD + 1
+
+    @staticmethod
+    def _prefer_vertical(candidates: list[Direction]) -> list[Direction]:
+        vertical = [d for d in candidates if EnemyStateMachine.is_vertical(d)]
+        return vertical if vertical else candidates
+
+    @staticmethod
+    def _is_self_territory(game: GameApi, position: GridPosition) -> bool:
+        """False for cells outside the visible window."""
+        cell = find_cell(game.get_visible_grid(), position)
+        return cell is not None and cell.territory == TerritoryView.SELF
+
+    def _choose_best(self, game: GameApi, candidates: list[Direction], ranking) -> Direction:
+        if not candidates:
+            return self._fallback(game)
+        return min(candidates, key=ranking)
+
+    def _choose_random(self, game: GameApi, candidates: list[Direction]) -> Direction:
+        if not candidates:
+            return self._fallback(game)
+        return candidates[self._random.randrange(len(candidates))]
+
+    @staticmethod
+    def _distance_to_key(game: GameApi, target: GridPosition):
+        return lambda direction: manhattan_distance(EnemyStateMachine._destination(game, direction), target)
+
+    @staticmethod
+    def _find_opponent_trail_on_our_territory(game: GameApi) -> GridPosition | None:
+        """Nearest visible cell where the opponent's trail is crossing land
+        that's ours — an intrusion worth punishing."""
+        from_position = game.get_agent_position()
         best: GridPosition | None = None
         best_distance: int | None = None
         for row in game.get_visible_grid():
             for cell in row:
-                if matches(cell):
-                    distance = manhattan_distance(origin, cell.position)
+                if cell.territory == TerritoryView.SELF and cell.occupant == OccupantView.OPPONENT_TRAIL:
+                    distance = manhattan_distance(from_position, cell.position)
                     if best_distance is None or distance < best_distance:
                         best_distance = distance
                         best = cell.position
         return best
 
     @staticmethod
-    def _destination(game: GameApi, direction: Direction) -> GridPosition:
-        return next_position(game.get_agent_position(), direction)
+    def _fallback(game: GameApi) -> Direction:
+        valid = valid_directions(game)
+        return valid[0] if valid else Direction.NORTH
+
+    # ---- Pure helpers (no GameApi; unit-testable directly) ---------------
 
     @staticmethod
-    def _cell_at(game: GameApi, position: GridPosition) -> VisibleCell | None:
-        """None only when position is off the board (a corner or edge), not
-        an open cell."""
-        if not is_within_board(position, game.get_board_width(), game.get_board_height()):
-            return None
-        cell = find_cell(game.get_visible_grid(), position)
-        return cell if cell is not None else VisibleCell(position, OccupantView.EMPTY, TerritoryView.UNOWNED)
-
-    def _occupant_at(self, game: GameApi, position: GridPosition) -> OccupantView | None:
-        cell = self._cell_at(game, position)
-        return None if cell is None else cell.occupant
-
-    def _territory_at(self, game: GameApi, position: GridPosition) -> TerritoryView | None:
-        cell = self._cell_at(game, position)
-        return None if cell is None else cell.territory
+    def chebyshev_distance(a: GridPosition, b: GridPosition) -> int:
+        return max(abs(a.x - b.x), abs(a.y - b.y))
 
     @staticmethod
-    def _is_open(cell: VisibleCell | None) -> bool:
-        return cell is not None and cell.occupant == OccupantView.EMPTY and cell.territory == TerritoryView.UNOWNED
+    def fits_safety_grid(head: GridPosition, trail: list[GridPosition], grid_size: int) -> bool:
+        """Every cell in trail must stay within grid_size // 2 of head.
+        Vacuously true for an empty trail."""
+        half = grid_size // 2
+        return all(EnemyStateMachine.chebyshev_distance(cell, head) <= half for cell in trail)
 
-    def _fallback(self) -> Direction:
-        return random_direction(self._random)
+    @staticmethod
+    def opposite(direction: Direction) -> Direction:
+        return {
+            Direction.NORTH: Direction.SOUTH,
+            Direction.SOUTH: Direction.NORTH,
+            Direction.EAST: Direction.WEST,
+            Direction.WEST: Direction.EAST,
+        }[direction]
+
+    @staticmethod
+    def perpendicular_options(direction: Direction) -> list[Direction]:
+        if direction in (Direction.NORTH, Direction.SOUTH):
+            return [Direction.EAST, Direction.WEST]
+        return [Direction.NORTH, Direction.SOUTH]
+
+    @staticmethod
+    def mirror_back(position: GridPosition, out_direction: Direction, steps: int) -> GridPosition:
+        """Walks steps cells in the reverse of out_direction from position."""
+        result = position
+        reverse = EnemyStateMachine.opposite(out_direction)
+        for _ in range(steps):
+            result = next_position(result, reverse)
+        return result
+
+    @staticmethod
+    def is_vertical(direction: Direction) -> bool:
+        return direction in (Direction.NORTH, Direction.SOUTH)
