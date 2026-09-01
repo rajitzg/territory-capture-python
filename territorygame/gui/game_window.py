@@ -1,16 +1,23 @@
 """Top-level pygame application: lets the user pick which controller
-occupies each player slot and drives Start/Pause/Step/Reset. Contains no
-game-rule logic; every update arrives as an immutable GameSnapshot from
-the engine's background thread and is picked up here once per frame on
-the main thread. The pygame analogue of GameWindow.java.
+occupies each player slot and drives Start/Pause/Back/Forward/Back 10/
+Forward 10/Step/Reset. Review buttons only change which already-received
+snapshot is shown; they never rewind match state. Contains no game-rule
+logic; every update arrives as an immutable GameSnapshot from the
+engine's background thread and is picked up here once per frame on the
+main thread. The pygame analogue of GameWindow.java.
 
-Swing's invokeLater has no pygame equivalent, so instead the latest
-snapshot is stashed behind a lock by on_game_state_changed() (called from
-the engine's background thread) and read once per frame by the main
-loop — same non-blocking, always-render-the-latest-available-state
-behavior, different mechanism."""
+Swing's invokeLater has no pygame equivalent, so instead each snapshot is
+ingested into a SnapshotHistory behind a lock by on_game_state_changed()
+(called from the engine's background thread), and a consistent view of
+that history is read once per frame by the main loop — same non-blocking,
+always-render-the-latest-available-state behavior, different mechanism.
+In Java, GameWindow owns snapshotHistory directly because invokeLater
+already confines all access to the EDT; here the lock does that job
+instead, since review-button clicks (main thread) and incoming snapshots
+(background thread) would otherwise race on the same history."""
 
 import threading
+from dataclasses import dataclass
 
 import pygame
 
@@ -20,12 +27,15 @@ from territorygame.engine.game_engine import GameEngine
 from territorygame.engine.game_observer import GameObserver
 from territorygame.engine.game_snapshot import GameSnapshot
 from territorygame.gui.board_renderer import AGENT_COLORS, draw_board
+from territorygame.gui.snapshot_history import SnapshotHistory
 
 _BACKGROUND = (255, 255, 255)
 _TEXT_COLOR = (20, 20, 20)
+_TEXT_COLOR_DISABLED = (180, 180, 180)
 _ERROR_BG = (255, 225, 225)
 _ERROR_TEXT = (150, 0, 0)
 _BUTTON_BG = (230, 230, 230)
+_BUTTON_BG_DISABLED = (245, 245, 245)
 _BUTTON_BORDER = (150, 150, 150)
 _SIDE_PANEL_WIDTH = 300
 _TOP_BAR_HEIGHT = 90
@@ -37,6 +47,7 @@ _MAX_TURN_DELAY_MILLIS = 500
 # fast end isn't cramped into a tiny fraction of the track (same curve
 # Java's GameWindow used).
 _SPEED_SLIDER_MAX = 1000
+_REVIEW_SKIP = 10
 
 
 def _delay_to_slider(delay_millis: int) -> int:
@@ -48,37 +59,80 @@ def _slider_to_delay(slider_value: int) -> int:
     return round(t * t * _MAX_TURN_DELAY_MILLIS)
 
 
+def ingest_engine_snapshot(history: "SnapshotHistory[GameSnapshot]", snapshot: GameSnapshot) -> None:
+    """Fresh matches (Reset / first paint) publish last_move_result is
+    None. Replace history so an in-flight Step that finished just before
+    Reset cannot leave a leftover frame behind the new initial board."""
+    if snapshot.last_move_result is None:
+        history.clear()
+    history.record(snapshot)
+
+
+@dataclass(frozen=True)
+class _HistoryView:
+    """A consistent, lock-free-to-read snapshot of the history's state for
+    one frame — copied out under the lock so drawing never has to hold it."""
+
+    current: GameSnapshot
+    can_go_back: bool
+    can_go_forward: bool
+    is_at_live: bool
+    position: int
+    size: int
+
+
 class _SnapshotSink(GameObserver):
-    """Receives snapshots on the engine's background thread; the main loop
-    reads the latest one each frame under a lock."""
+    """Receives snapshots on the engine's background thread and ingests
+    them into a SnapshotHistory guarded by a lock; the main loop reads a
+    consistent _HistoryView once per frame under the same lock."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._latest: GameSnapshot | None = None
+        self._history: SnapshotHistory[GameSnapshot] = SnapshotHistory()
 
     def on_game_state_changed(self, snapshot: GameSnapshot) -> None:
         with self._lock:
-            self._latest = snapshot
+            ingest_engine_snapshot(self._history, snapshot)
 
-    def latest(self) -> GameSnapshot | None:
+    def review_back(self, steps: int) -> bool:
         with self._lock:
-            return self._latest
+            return self._history.back(steps)
+
+    def review_forward(self, steps: int) -> bool:
+        with self._lock:
+            return self._history.forward(steps)
+
+    def view(self) -> _HistoryView | None:
+        with self._lock:
+            if self._history.size() == 0:
+                return None
+            return _HistoryView(
+                current=self._history.current(),
+                can_go_back=self._history.can_go_back(),
+                can_go_forward=self._history.can_go_forward(),
+                is_at_live=self._history.is_at_live(),
+                position=self._history.position(),
+                size=self._history.size(),
+            )
 
 
 class _Button:
-    def __init__(self, rect: pygame.Rect, label: str, on_click) -> None:
+    def __init__(self, rect: pygame.Rect, label: str, on_click, enabled: bool = True) -> None:
         self.rect = rect
         self.label = label
         self.on_click = on_click
+        self.enabled = enabled
 
     def draw(self, surface: pygame.Surface, font: pygame.font.Font) -> None:
-        pygame.draw.rect(surface, _BUTTON_BG, self.rect)
+        bg = _BUTTON_BG if self.enabled else _BUTTON_BG_DISABLED
+        text_color = _TEXT_COLOR if self.enabled else _TEXT_COLOR_DISABLED
+        pygame.draw.rect(surface, bg, self.rect)
         pygame.draw.rect(surface, _BUTTON_BORDER, self.rect, width=1)
-        text = font.render(self.label, True, _TEXT_COLOR)
+        text = font.render(self.label, True, text_color)
         surface.blit(text, text.get_rect(center=self.rect.center))
 
     def handle_click(self, position: tuple[int, int]) -> None:
-        if self.rect.collidepoint(position):
+        if self.enabled and self.rect.collidepoint(position):
             self.on_click()
 
 
@@ -188,15 +242,25 @@ class GameWindow:
         self._engine.add_observer(self._sink)
 
         self._turn_delay_millis = config.autoplay_turn_delay_millis
+        self._back_ten_button = _Button(pygame.Rect(322, 46, 64, 28), "Back 10", lambda: self._review_back(_REVIEW_SKIP), enabled=False)
+        self._back_button = _Button(pygame.Rect(394, 46, 54, 28), "Back", lambda: self._review_back(1), enabled=False)
+        self._forward_button = _Button(pygame.Rect(456, 46, 68, 28), "Forward", lambda: self._review_forward(1), enabled=False)
+        self._forward_ten_button = _Button(
+            pygame.Rect(532, 46, 78, 28), "Forward 10", lambda: self._review_forward(_REVIEW_SKIP), enabled=False
+        )
         self._buttons = [
             _Button(pygame.Rect(10, 46, 70, 28), "Start", self._engine.start),
             _Button(pygame.Rect(88, 46, 70, 28), "Pause", self._engine.pause),
             _Button(pygame.Rect(166, 46, 70, 28), "Step", self._engine.step),
             _Button(pygame.Rect(244, 46, 70, 28), "Reset", self._reset),
+            self._back_ten_button,
+            self._back_button,
+            self._forward_button,
+            self._forward_ten_button,
         ]
         clamped_initial_delay = max(_MIN_TURN_DELAY_MILLIS, min(_MAX_TURN_DELAY_MILLIS, self._turn_delay_millis))
         self._speed_slider = _Slider(
-            pygame.Rect(404, 60, 140, 4), 0, _SPEED_SLIDER_MAX,
+            pygame.Rect(710, 60, 140, 4), 0, _SPEED_SLIDER_MAX,
             _delay_to_slider(clamped_initial_delay), self._on_speed_slider_changed,
         )
 
@@ -215,6 +279,13 @@ class GameWindow:
 
     def _reset(self) -> None:
         self._engine.reset(self._current_selections())
+
+    def _review_back(self, steps: int) -> None:
+        self._engine.pause()
+        self._sink.review_back(steps)
+
+    def _review_forward(self, steps: int) -> None:
+        self._sink.review_forward(steps)
 
     def _on_speed_slider_changed(self, slider_value: int) -> None:
         """Left is Fast (0ms), right is Slow (500ms); see _slider_to_delay
@@ -245,6 +316,12 @@ class GameWindow:
         pygame.quit()
 
     def _draw(self) -> None:
+        view = self._sink.view()
+        self._back_ten_button.enabled = view is not None and view.can_go_back
+        self._back_button.enabled = view is not None and view.can_go_back
+        self._forward_button.enabled = view is not None and view.can_go_forward
+        self._forward_ten_button.enabled = view is not None and view.can_go_forward
+
         self._screen.fill(_BACKGROUND)
         for picker in self._player_pickers:
             picker.draw(self._screen, self._font)
@@ -252,21 +329,20 @@ class GameWindow:
             button.draw(self._screen, self._font)
         self._draw_speed_control()
 
-        snapshot = self._sink.latest()
-        if snapshot is not None:
-            draw_board(self._screen, self._board_area, snapshot)
-            self._draw_side_panel(snapshot)
-            self._draw_status_bar(snapshot)
+        if view is not None:
+            draw_board(self._screen, self._board_area, view.current)
+            self._draw_side_panel(view.current)
+            self._draw_status_bar(view)
 
         pygame.display.flip()
 
     def _draw_speed_control(self) -> None:
         """Controls the pause between turns during continuous play
         (Start); Step always runs immediately."""
-        self._blit("Speed:", 324, 52, self._font)
-        self._blit("Fast", 372, 52, self._font)
+        self._blit("Speed:", 630, 52, self._font)
+        self._blit("Fast", 678, 52, self._font)
         self._speed_slider.draw(self._screen)
-        self._blit("Slow", 552, 52, self._font)
+        self._blit("Slow", 858, 52, self._font)
 
     def _draw_side_panel(self, snapshot: GameSnapshot) -> None:
         x = self._board_area.right + 10
@@ -319,7 +395,8 @@ class GameWindow:
         lines.append(current)
         return lines
 
-    def _draw_status_bar(self, snapshot: GameSnapshot) -> None:
+    def _draw_status_bar(self, view: _HistoryView) -> None:
+        snapshot = view.current
         bar_y = self._board_area.bottom
         pygame.draw.rect(self._screen, _BACKGROUND, pygame.Rect(0, bar_y, self._board_area.width, _STATUS_BAR_HEIGHT))
 
@@ -329,6 +406,8 @@ class GameWindow:
             active_index = self._index_of_active_player(snapshot)
             last = snapshot.last_move_result.name if snapshot.last_move_result is not None else "-"
             text = f"Active: Player {active_index + 1}   ·   Last move: {last}"
+        if not view.is_at_live:
+            text = f"Reviewing {view.position} / {view.size}   ·   {text}"
         self._blit(text, 10, bar_y + 8, self._bold_font)
 
         if snapshot.error_message:
