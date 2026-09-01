@@ -1,8 +1,7 @@
 """Applies capture effects when a player's trail closes: converting the
-trail to territory and flood-filling the region it encloses. Enclosure
-uses cardinal adjacency and a flood fill from the board edge, treating the
-capturer's territory as the boundary; cells unreached by the fill are
-enclosed."""
+trail to territory and flood-filling only the region that trail newly
+encloses. Existing holes in the capturer's territory (for example an
+opponent island created by respawn) are left untouched."""
 
 from collections import deque
 
@@ -20,13 +19,16 @@ class TerritoryResolver:
         capturer = state.get_player(capturer_id)
         agent = capturer.get_agent()
 
+        already_enclosed = set(self._find_enclosed_cells(board, capturer_id))
+
         trail = agent.get_active_trail()
         for cell in trail:
             board.set_territory_owner(cell, capturer_id)
             board.set_trail_owner(cell, None)
 
         for enclosed_cell in self._find_enclosed_cells(board, capturer_id):
-            board.set_territory_owner(enclosed_cell, capturer_id)
+            if enclosed_cell not in already_enclosed:
+                board.set_territory_owner(enclosed_cell, capturer_id)
 
         agent.clear_trail()
 

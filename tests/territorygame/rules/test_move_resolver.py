@@ -177,3 +177,59 @@ def test_moving_onto_opponents_trail_at_its_own_respawn_point_does_not_stack_age
     assert mover_position == opponent_respawn
     assert mover_position != opponent_new_position
     assert state.get_kill_count(player0) == 1
+
+
+def test_closing_a_loop_on_a_cell_that_kills_the_opponent_preserves_their_starting_territory():
+    # Player0 returns home (closing a loop) onto a cell that also has
+    # player1's trail, so both a capture and a kill resolve in one move.
+    # Respawn then restores the start platform.
+    p1_start = GridPosition(4, 4)
+    p0_territory = [
+        GridPosition(1, 1),
+        GridPosition(3, 3), GridPosition(4, 3), GridPosition(5, 3),
+        GridPosition(3, 4), GridPosition(5, 4),
+        GridPosition(3, 5), GridPosition(4, 5), GridPosition(5, 5),
+    ]
+    state = two_player_state(8, 8, GridPosition(1, 1), p0_territory, p1_start, [p1_start], 10)
+
+    state.get_player(player0).get_agent().set_position(GridPosition(1, 2))
+    state.get_board().set_trail_owner(GridPosition(1, 2), player0)
+    state.get_player(player0).get_agent().append_trail(GridPosition(1, 2))
+
+    state.get_player(player1).get_agent().set_position(GridPosition(1, 3))
+    state.get_board().set_trail_owner(GridPosition(1, 1), player1)
+    state.get_player(player1).get_agent().append_trail(GridPosition(1, 1))
+
+    result = resolver.resolve(state, player0, Direction.NORTH)
+
+    assert result == MoveResult.CAPTURED
+    assert state.get_kill_count(player0) == 1
+    assert state.get_player(player1).get_agent().get_position() == p1_start
+    assert state.get_board().territory_owner_at(p1_start) == player1
+    assert state.get_board().territory_count(player1) == 1
+
+
+def test_enclosing_opponent_start_without_a_kill_claims_it_and_does_not_respawn_them():
+    p1_start = GridPosition(3, 3)
+    p1_position = GridPosition(7, 7)
+    state = two_player_state(8, 8, GridPosition(2, 2), [GridPosition(2, 2)], p1_start, [p1_start], 10)
+    state.get_player(player1).get_agent().set_position(p1_position)
+
+    perimeter = [
+        GridPosition(3, 2), GridPosition(4, 2),
+        GridPosition(4, 3), GridPosition(4, 4),
+        GridPosition(3, 4), GridPosition(2, 4), GridPosition(2, 3),
+    ]
+    for cell in perimeter:
+        state.get_board().set_trail_owner(cell, player0)
+        state.get_player(player0).get_agent().append_trail(cell)
+    state.get_player(player0).get_agent().set_position(GridPosition(2, 3))
+
+    result = resolver.resolve(state, player0, Direction.NORTH)
+
+    assert result == MoveResult.CAPTURED
+    assert state.get_kill_count(player0) == 0
+    assert state.get_death_count(player1) == 0
+    assert state.get_player(player1).get_agent().get_position() == p1_position
+    assert state.get_board().territory_owner_at(p1_start) == player0
+    assert state.get_board().territory_count(player1) == 0

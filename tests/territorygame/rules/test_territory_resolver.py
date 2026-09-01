@@ -44,6 +44,25 @@ def test_capture_flips_opponent_territory_inside_the_enclosed_region():
     assert state.get_board().territory_count(opponent) == 1
 
 
+def test_capture_does_not_fill_an_already_enclosed_opponent_island():
+    island = GridPosition(6, 6)
+    capturer_territory = [
+        HOME,
+        GridPosition(5, 5), GridPosition(6, 5), GridPosition(7, 5),
+        GridPosition(5, 6), GridPosition(7, 6),
+        GridPosition(5, 7), GridPosition(6, 7), GridPosition(7, 7),
+    ]
+    state = two_player_state(8, 8, HOME, capturer_territory, island, [island], 10)
+    for cell in PERIMETER:
+        state.get_board().set_trail_owner(cell, capturer)
+        state.get_player(capturer).get_agent().append_trail(cell)
+
+    resolver.apply_capture(state, capturer)
+
+    assert state.get_board().territory_owner_at(ENCLOSED) == capturer
+    assert state.get_board().territory_owner_at(island) == opponent
+
+
 def test_unrelated_opponent_trail_inside_the_enclosed_region_is_untouched():
     state = _build_state_with_pending_trail()
     state.get_board().set_trail_owner(ENCLOSED, opponent)

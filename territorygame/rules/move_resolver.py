@@ -36,22 +36,22 @@ class MoveResolver:
             state.decrement_remaining_turns(mover_id)
             return MoveResult.DIED
 
-        # Move the mover onto its destination before respawning a killed
-        # opponent, so RespawnService's occupancy check sees where the mover
-        # actually ends up rather than where it moved from. Otherwise, if the
-        # mover is stepping onto the opponent's own respawn point, the
-        # opponent could respawn there and the mover would then move onto
-        # the same cell.
+        # Move first so occupancy checks see the mover's destination. Capture
+        # before a same-tick kill so the flood-fill can claim enclosed land
+        # (including the opponent's start); respawn then restores the start.
         mover_agent.set_position(destination)
+
+        territory_owner_at_destination = board.territory_owner_at(destination)
+        captured = mover_id == territory_owner_at_destination and not mover_agent.is_trail_empty()
+        if captured:
+            self._territory_resolver.apply_capture(state, mover_id)
 
         if opponent.get_id() == trail_owner_at_destination:
             self._respawn_service.respawn(state, opponent.get_id())
             state.increment_kill_count(mover_id)
             state.increment_death_count(opponent.get_id())
 
-        territory_owner_at_destination = board.territory_owner_at(destination)
-        if mover_id == territory_owner_at_destination and not mover_agent.is_trail_empty():
-            self._territory_resolver.apply_capture(state, mover_id)
+        if captured:
             state.decrement_remaining_turns(mover_id)
             return MoveResult.CAPTURED
 
