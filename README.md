@@ -124,8 +124,8 @@ candidate/
                              basic_state_machine.py (a deliberately weak
                              state-machine example) and
                              random_state_machine.py (the simplest
-                             possible baseline). Not templates for a good
-                             strategy.
+                             possible baseline) are not templates for a
+                             good strategy.
 
 tests/                       mirrors the territorygame/candidate package layout.
 ```

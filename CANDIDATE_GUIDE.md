@@ -9,8 +9,9 @@ you like. Nothing outside it needs to change, and nothing outside it
 should.
 
 Inside `candidate/`, `examples/` has a couple of read-only implementations
-worth studying. There's also a more advanced opponent to practice against,
-shown as "Enemy State Machine" in the GUI.
+that only demonstrate the mechanics — not a strategy worth copying.
+There's also an opponent to practice against, shown as "Enemy State Machine"
+in the GUI.
 
 ## The rules
 
